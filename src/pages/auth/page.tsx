@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "@/hooks/useAuth";
 
@@ -108,8 +108,28 @@ export default function Auth() {
   }
 
   const id = supplierId.trim().toUpperCase();
-  const showFirstAccessHint = id && supplierExists(id) && isFirstAccess(id) && mode === "login";
-  const showNormalAccessHint = id && supplierExists(id) && !isFirstAccess(id) && mode === "register";
+  const [idExists, setIdExists] = useState(false);
+  const [idIsFirstAccess, setIdIsFirstAccess] = useState(false);
+
+  useEffect(() => {
+    if (!id) {
+      setIdExists(false);
+      setIdIsFirstAccess(false);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const [exists, firstAccess] = await Promise.all([supplierExists(id), isFirstAccess(id)]);
+      if (!cancelled) {
+        setIdExists(exists);
+        setIdIsFirstAccess(firstAccess);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [id]);
+
+  const showFirstAccessHint = id && idExists && idIsFirstAccess && mode === "login";
+  const showNormalAccessHint = id && idExists && !idIsFirstAccess && mode === "register";
 
   const categoryOptions = [
     { value: "café", label: "Café" },

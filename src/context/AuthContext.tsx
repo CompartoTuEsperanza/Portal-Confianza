@@ -1,5 +1,5 @@
 import { createContext, useContext, useState, useEffect, type ReactNode } from "react";
-import { suppliers, type Supplier } from "@/mocks/suppliers";
+import { supabase, hashPassword } from "@/lib/supabaseClient";
 
 interface AuthUser {
   supplier_id: string;
@@ -16,26 +16,14 @@ interface AuthContextType {
   registerNewSupplier: (name: string, category: string, password: string, confirmPassword: string) => Promise<{ success: boolean; message: string; supplier_id?: string }>;
   logout: () => void;
   loginAdmin: (password: string) => { success: boolean; message: string };
-  isFirstAccess: (supplier_id: string) => boolean;
-  supplierExists: (supplier_id: string) => boolean;
+  isFirstAccess: (supplier_id: string) => Promise<boolean>;
+  supplierExists: (supplier_id: string) => Promise<boolean>;
 }
 
 const AuthContext = createContext<AuthContextType | null>(null);
 
-const STORAGE_KEY = "supplier_auth_users_v2";
-const SESSION_KEY = "supplier_auth_session_v2";
-
-function getStoredUsers(): Supplier[] {
-  // Borrar datos viejos con la key anterior para evitar conflictos
-  localStorage.removeItem("supplier_auth_users");
-
-  const stored = localStorage.getItem(STORAGE_KEY);
-  if (stored) {
-    return JSON.parse(stored);
-  }
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(suppliers));
-  return suppliers;
-}
+// La SESIÓN sí puede vivir en localStorage (solo dice "quién eres", no la contraseña)
+const SESSION_KEY = "supplier_auth_session_v3";
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(null);
@@ -45,8 +33,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const session = localStorage.getItem(SESSION_KEY);
     if (session) {
       try {
-        const parsed = JSON.parse(session);
-        setUser(parsed);
+        setUser(JSON.parse(session));
       } catch {
         localStorage.removeItem(SESSION_KEY);
       }
@@ -54,15 +41,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setIsLoading(false);
   }, []);
 
-  function supplierExists(supplier_id: string): boolean {
-    const users = getStoredUsers();
-    return users.some((u) => u.supplier_id === supplier_id && u.status === "active");
+  async function supplierExists(supplier_id: string): Promise<boolean> {
+    const { data, error } = await supabase.rpc("rpc_supplier_exists", { p_supplier_id: supplier_id });
+    if (error) return false;
+    return !!data;
   }
 
-  function isFirstAccess(supplier_id: string): boolean {
-    const users = getStoredUsers();
-    const found = users.find((u) => u.supplier_id === supplier_id);
-    return found ? found.password === null : false;
+  async function isFirstAccess(supplier_id: string): Promise<boolean> {
+    const { data, error } = await supabase.rpc("rpc_is_first_access", { p_supplier_id: supplier_id });
+    if (error) return false;
+    return !!data;
   }
 
   async function registerFirstAccess(
@@ -70,34 +58,31 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     password: string,
     confirmPassword: string,
   ): Promise<{ success: boolean; message: string }> {
-    if (!supplierExists(supplier_id)) {
+    if (!(await supplierExists(supplier_id))) {
       return { success: false, message: "Código no encontrado o inactivo." };
     }
-
-    if (!isFirstAccess(supplier_id)) {
+    if (!(await isFirstAccess(supplier_id))) {
       return { success: false, message: "Este código ya tiene una contraseña configurada. Use el acceso normal." };
     }
-
     if (password.length < 6) {
       return { success: false, message: "La contraseña debe tener al menos 6 caracteres." };
     }
-
     if (password !== confirmPassword) {
       return { success: false, message: "Las contraseñas no coinciden." };
     }
 
-    const users = getStoredUsers();
-    const updated = users.map((u) =>
-      u.supplier_id === supplier_id ? { ...u, password } : u,
-    );
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
+    const password_hash = await hashPassword(password);
+    const { data, error } = await supabase.rpc("rpc_set_password", {
+      p_supplier_id: supplier_id,
+      p_password_hash: password_hash,
+    });
 
-    const found = updated.find((u) => u.supplier_id === supplier_id)!;
-    const authUser: AuthUser = {
-      supplier_id: found.supplier_id,
-      name: found.name,
-      category: found.category,
-    };
+    if (error || !data || data.length === 0) {
+      return { success: false, message: "No se pudo guardar la contraseña. Intenta de nuevo." };
+    }
+
+    const found = data[0];
+    const authUser: AuthUser = { supplier_id: found.supplier_id, name: found.name, category: found.category };
     localStorage.setItem(SESSION_KEY, JSON.stringify(authUser));
     setUser(authUser);
 
@@ -120,62 +105,45 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       return { success: false, message: "Las contraseñas no coinciden." };
     }
 
-    const users = getStoredUsers();
+    const password_hash = await hashPassword(password);
+    const { data, error } = await supabase.rpc("rpc_register_new", {
+      p_name: name.trim(),
+      p_category: category.trim().toLowerCase(),
+      p_password_hash: password_hash,
+    });
 
-    const maxNum = users.reduce((max, u) => {
-      const match = u.supplier_id.match(/SUP-(\d+)/);
-      if (match) {
-        const num = parseInt(match[1], 10);
-        return Math.max(max, num);
-      }
-      return max;
-    }, 0);
+    if (error || !data || data.length === 0) {
+      return { success: false, message: "No se pudo completar el registro. Intenta de nuevo." };
+    }
 
-    const newId = `SUP-${String(maxNum + 1).padStart(3, "0")}`;
-
-    const newSupplier: Supplier = {
-      supplier_id: newId,
-      name: name.trim(),
-      category: category.trim().toLowerCase(),
-      password,
-      status: "active",
-    };
-
-    users.push(newSupplier);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(users));
-
-    const authUser: AuthUser = {
-      supplier_id: newSupplier.supplier_id,
-      name: newSupplier.name,
-      category: newSupplier.category,
-    };
+    const found = data[0];
+    const authUser: AuthUser = { supplier_id: found.supplier_id, name: found.name, category: found.category };
     localStorage.setItem(SESSION_KEY, JSON.stringify(authUser));
     setUser(authUser);
 
-    return { success: true, message: "Registro exitoso. Bienvenido al portal.", supplier_id: newId };
+    return { success: true, message: "Registro exitoso. Bienvenido al portal.", supplier_id: found.supplier_id };
   }
 
   async function login(supplier_id: string, password: string): Promise<{ success: boolean; message: string }> {
-    if (!supplierExists(supplier_id)) {
+    if (!(await supplierExists(supplier_id))) {
       return { success: false, message: "Código no encontrado o inactivo." };
     }
-
-    if (isFirstAccess(supplier_id)) {
+    if (await isFirstAccess(supplier_id)) {
       return { success: false, message: "Este es su primer acceso. Por favor, configure su contraseña primero." };
     }
 
-    const users = getStoredUsers();
-    const found = users.find((u) => u.supplier_id === supplier_id);
+    const password_hash = await hashPassword(password);
+    const { data, error } = await supabase.rpc("rpc_login", {
+      p_supplier_id: supplier_id,
+      p_password_hash: password_hash,
+    });
 
-    if (!found || found.password !== password) {
+    if (error || !data || data.length === 0) {
       return { success: false, message: "Código o contraseña incorrectos." };
     }
 
-    const authUser: AuthUser = {
-      supplier_id: found.supplier_id,
-      name: found.name,
-      category: found.category,
-    };
+    const found = data[0];
+    const authUser: AuthUser = { supplier_id: found.supplier_id, name: found.name, category: found.category };
     localStorage.setItem(SESSION_KEY, JSON.stringify(authUser));
     setUser(authUser);
 
